@@ -1,13 +1,10 @@
 /*
  * Authored by Alex Hultman, 2018-2020.
  * Intellectual property of third-party.
-
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
  * You may obtain a copy of the License at
-
  *     http://www.apache.org/licenses/LICENSE-2.0
-
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -201,86 +198,26 @@ private:
         ((x > 96) & (x < '{'));
     }
     
-    static inline uint64_t hasLess(uint64_t x, uint64_t n) {
-        return (((x)-~0ULL/255*(n))&~(x)&~0ULL/255*128);
-    }
-
-    static inline uint64_t hasMore(uint64_t x, uint64_t n) {
-        return (( ((x)+~0ULL/255*(127-(n))) |(x))&~0ULL/255*128);
-    }
-
-    static inline uint64_t hasBetween(uint64_t x, uint64_t m, uint64_t n) {
-        return (( (~0ULL/255*(127+(n))-((x)&~0ULL/255*127)) &~(x)& (((x)&~0ULL/255*127)+~0ULL/255*(127-(m))) )&~0ULL/255*128);
-    }
-
-    static inline bool notFieldNameWord(uint64_t x) {
-        return hasLess(x, '-') |
-        hasBetween(x, '-', '0') |
-        hasBetween(x, '9', 'A') |
-        hasBetween(x, 'Z', 'a') |
-        hasMore(x, 'z');
-    }
-    
-    static inline void *consumeFieldName(char *p) {
-        for (; true; p += 8) {
-            uint64_t word;
-            memcpy(&word, p, sizeof(uint64_t));
-            if (notFieldNameWord(word)) {
-                while (isFieldNameByte(*(unsigned char *)p)) {
-                    *(p++) |= 0x20;
+    static void *memchr_r(const char *p, const char *end) {
+        uint64_t mask = *(uint64_t *)"\r\r\r\r\r\r\r\r";
+        if (p <= end - 8) {
+            for (; p <= end - 8; p += 8) {
+                uint64_t val = *(uint64_t *)p ^ mask;
+                if ((val + 0xfefefefefefefeffull) & (~val & 0x8080808080808080ull)) {
+                    break;
                 }
+            }
+        }
+
+        for (; p < end; p++) {
+            if (*(unsigned char *)p == '\r') {
                 return (void *)p;
             }
-            word |= 0x2020202020202020ull;
-            memcpy(p, &word, sizeof(uint64_t));
         }
-    }
 
-    /* Puts method as key, target as value and returns non-null (or nullptr on error). */
-    static inline char *consumeRequestLine(char *data, HttpRequest::Header &header) {
-        /* Scan until single SP, assume next is / (origin request) */
-        char *start = data;
-        /* This catches the post padded CR and fails */
-        while (data[0] > 32) data++;
-        if (data[0] == 32 && data[1] == '/') {
-            header.key = {start, (size_t) (data - start)};
-            data++;
-            /* Scan for less than 33 (catches post padded CR and fails) */
-            start = data;
-            for (; true; data += 8) {
-                uint64_t word;
-                memcpy(&word, data, sizeof(uint64_t));
-                if (hasLess(word, 33)) {
-                    while (*(unsigned char *)data > 32) data++;
-                    /* Now we stand on space */
-                    header.value = {start, (size_t) (data - start)};
-                    /* Check that the following is http 1.1 */
-                    if (memcmp(" HTTP/1.1\r\n", data, 11) == 0) {
-                        return data + 11;
-                    }
-                    return nullptr;
-                }
-            }
-        }
         return nullptr;
-    }
+     }
 
-    /* RFC 9110: 5.5 Field Values (TLDR; anything above 31 is allowed; htab (9) is also allowed)
-     * Field values are usually constrained to the range of US-ASCII characters [...]
-     * Field values containing CR, LF, or NUL characters are invalid and dangerous [...]
-     * Field values containing other CTL characters are also invalid. */
-    static inline void *tryConsumeFieldValue(char *p) {
-        for (; true; p += 8) {
-            uint64_t word;
-            memcpy(&word, p, sizeof(uint64_t));
-            if (hasLess(word, 32)) {
-                while (*(unsigned char *)p > 31) p++;
-                return (void *)p;
-            }
-        }
-    }
-
-    /* End is only used for the proxy parser. The HTTP parser recognizes "\ra" as invalid "\r\n" scan and breaks. */
     static unsigned int getHeaders(char *postPaddedBuffer, char *end, struct HttpRequest::Header *headers, void *reserved) {
         char *preliminaryKey, *preliminaryValue, *start = postPaddedBuffer;
 
@@ -310,78 +247,29 @@ private:
          * for PROXY means we can end up succeeding, yet leaving bytes in the fallback buffer
          * which is then removed, and our counters to flip due to overflow and we end up with a crash */
 
-        /* The request line is different from the field names / field values */
-        if (!(postPaddedBuffer = consumeRequestLine(postPaddedBuffer, headers[0]))) {
-            /* Error - invalid request line */
-            return 0;
-        }
-        headers++;
-
-        for (unsigned int i = 1; i < HttpRequest::MAX_HEADERS - 1; i++) {
-            /* Lower case and consume the field name */
-            preliminaryKey = postPaddedBuffer;
-            postPaddedBuffer = (char *) consumeFieldName(postPaddedBuffer);
-            headers->key = std::string_view(preliminaryKey, (size_t) (postPaddedBuffer - preliminaryKey));
-
-            /* We should not accept whitespace between key and colon, so colon must foloow immediately */
-            if (postPaddedBuffer[0] != ':') {
-                /* Error: invalid chars in field name */
-                return 0;
-            }
-            postPaddedBuffer++;
-
-            preliminaryValue = postPaddedBuffer;
-            /* The goal of this call is to find next "\r\n", or any invalid field value chars, fast */
-            while (true) {
-                postPaddedBuffer = (char *) tryConsumeFieldValue(postPaddedBuffer);
-                /* If this is not CR then we caught some stinky invalid char on the way */
-                if (postPaddedBuffer[0] != '\r') {
-                    /* If TAB then keep searching */
-                    if (postPaddedBuffer[0] == '\t') {
-                        postPaddedBuffer++;
-                        continue;
-                    }
-                    /* Error - invalid chars in field value */
+        for (unsigned int i = 0; i < HttpRequest::MAX_HEADERS; i++) {
+            for (preliminaryKey = postPaddedBuffer; (*postPaddedBuffer != ':') & (*(unsigned char *)postPaddedBuffer > 32); *(postPaddedBuffer++) |= 32);
+            if (*postPaddedBuffer == '\r') {
+                if ((postPaddedBuffer != end) & (postPaddedBuffer[1] == '\n') & (i > 0)) {
+                    headers->key = std::string_view(nullptr, 0);
+                    return (unsigned int) ((postPaddedBuffer + 2) - start);
+                } else {
                     return 0;
                 }
-                break;
-            }
-            /* We fence end[0] with \r, followed by end[1] being something that is "not \n", to signify "not found".
-                * This way we can have this one single check to see if we found \r\n WITHIN our allowed search space. */
-            if (postPaddedBuffer[1] == '\n') {
-                /* Store this header, it is valid */
-                headers->value = std::string_view(preliminaryValue, (size_t) (postPaddedBuffer - preliminaryValue));
-                postPaddedBuffer += 2;
-
-                /* Trim trailing whitespace (SP, HTAB) */
-                while (headers->value.length() && headers->value.back() < 33) {
-                    headers->value.remove_suffix(1);
-                }
-
-                /* Trim initial whitespace (SP, HTAB) */
-                while (headers->value.length() && headers->value.front() < 33) {
-                    headers->value.remove_prefix(1);
-                }
-                
-                headers++;
-
-                /* We definitely have at least one header (or request line), so check if we are done */
-                if (*postPaddedBuffer == '\r') {
-                    if (postPaddedBuffer[1] == '\n') {
-                        /* This cann take the very last header space */
-                        headers->key = std::string_view(nullptr, 0);
-                        return (unsigned int) ((postPaddedBuffer + 2) - start);
-                    } else {
-                        /* \r\n\r plus non-\n letter is malformed request, or simply out of search space */
-                        return 0;
-                    }
-                }
             } else {
-                /* We are either out of search space or this is a malformed request */
-                return 0;
+                headers->key = std::string_view(preliminaryKey, (size_t) (postPaddedBuffer - preliminaryKey));
+                for (postPaddedBuffer++; (*postPaddedBuffer == ':' || *(unsigned char *)postPaddedBuffer < 33) && *postPaddedBuffer != '\r'; postPaddedBuffer++);
+                preliminaryValue = postPaddedBuffer;
+                postPaddedBuffer = (char *) memchr_r(postPaddedBuffer, end);
+                if (postPaddedBuffer && postPaddedBuffer[1] == '\n') {
+                    headers->value = std::string_view(preliminaryValue, (size_t) (postPaddedBuffer - preliminaryValue));
+                    postPaddedBuffer += 2;
+                    headers++;
+                } else {
+                    return 0;
+                }
             }
         }
-        /* We ran out of header space, too large request */
         return 0;
     }
 
@@ -395,10 +283,8 @@ private:
         /* How much data we CONSUMED (to throw away) */
         unsigned int consumedTotal = 0;
 
-        /* Fence two bytes past end of our buffer (buffer has post padded margins).
-         * This is to always catch scan for \r but not for \r\n. */
+        /* Fence one byte past end of our buffer (buffer has post padded margins) */
         data[length] = '\r';
-        data[length + 1] = 'a'; /* Anything that is not \n, to trigger "invalid request" */
 
         for (unsigned int consumed; length && (consumed = getHeaders(data, data + length, req->headers, reserved)); ) {
             data += consumed;
