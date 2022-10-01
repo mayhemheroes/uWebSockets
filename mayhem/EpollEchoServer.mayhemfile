@@ -1,0 +1,4 @@
+project: PROJECT
+target: EpollEchoServer
+cmds:
+- cmd: /out/EpollEchoServer
