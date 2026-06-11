@@ -1,0 +1,5 @@
+project: uWebSockets
+target: EpollEchoServer
+cmds:
+  - cmd: /mayhem/EpollEchoServer
+    libfuzzer: true
